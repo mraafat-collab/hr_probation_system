@@ -97,7 +97,7 @@ st.markdown(f'<div class="brand"><div><span class="logo">RU<span>FI</span></span
 
 nav_col, set_col = st.columns([5, 1.6])
 with nav_col:
-    page = st.radio("القائمة", ["🏠 لوحة المتابعة", "📝 التقييمات المستحقة", "➕ إضافة موظف",
+    page = st.radio("القائمة", ["🏠 لوحة المتابعة", "👥 تحت الاختبار", "📝 التقييمات المستحقة", "➕ إضافة موظف",
                                 "📊 السجل العام", "📤 استيراد", "📥 التصدير والنسخ الاحتياطي"],
                     horizontal=True, label_visibility="collapsed")
 with set_col:
@@ -139,6 +139,55 @@ if page == "🏠 لوحة المتابعة":
             fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), yaxis_title=None, xaxis_title=None,
                               font=dict(family="Cairo"), yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig, use_container_width=True)
+
+# ------------------------------------------------------------ تحت الاختبار
+elif page == "👥 تحت الاختبار":
+    hero("الموظفون تحت الاختبار", "كل من لم يُتخذ في حقه قرار تثبيت أو عدم صلاحية بعد، مع نموذج تقييمه الحالي")
+    act = eng.get_active_probation()
+    if act.empty:
+        st.success("لا يوجد موظفون تحت الاختبار حالياً.")
+    else:
+        q = st.text_input("🔍 بحث بالاسم أو الكود أو الفرع")
+        view = act
+        if q:
+            view = act[act[["code", "name", "branch"]].fillna("").apply(
+                lambda s: s.str.contains(q, case=False, regex=False)).any(axis=1)]
+        st.caption(f"عدد الموظفين تحت الاختبار: {len(view)}")
+        st.dataframe(view[["level", "code", "name", "title", "branch", "stage", "due_date", "days_left"]]
+                     .rename(columns=COLS), use_container_width=True, hide_index=True)
+        ready = view[view["eval_id"].notna()]
+        if not ready.empty:
+            st.download_button(f"📦 تحميل نماذج الكل ({len(ready)}) في ملف ZIP", eng.forms_zip(ready),
+                               f"نماذج_RUFI_{date.today()}.zip", "application/zip")
+        if not view.empty:
+            st.divider()
+            code = st.selectbox("اختر الموظف", view["code"].tolist(), format_func=lambda c: (
+                f"{c} — {view.set_index('code').at[c, 'name']}"))
+            row = view[view["code"] == code].iloc[0]
+            left, right = st.columns(2)
+            with left:
+                st.markdown(f"#### 📄 {row['stage']}")
+                if pd.notna(row["eval_id"]):
+                    data, fname, mime = eng.generate_form(row.to_dict())
+                    kind = "Excel" if fname.endswith(".xlsx") else "Word"
+                    st.download_button(f"📄 تحميل نموذج التقييم ({kind})", data, fname, mime,
+                                       use_container_width=True, key="u_form")
+                else:
+                    st.info("لا توجد مرحلة تقييم معلقة لهذا الموظف.")
+                    if st.button("➕ إضافة مرحلة تقييم تمديد"):
+                        eng.add_extra_stage(code)
+                        st.rerun()
+            with right:
+                st.markdown("#### ✅ تسجيل القرار")
+                if pd.notna(row["eval_id"]):
+                    with st.form("decision_active"):
+                        decision = st.selectbox("القرار", eng.DECISIONS)
+                        score = st.number_input("الدرجة العامة (من 4) — اختياري", 0.0, 4.0, 0.0, 0.1)
+                        notes = st.text_area("ملاحظات / توصية المدير", height=80)
+                        if st.form_submit_button("حفظ القرار", type="primary", use_container_width=True):
+                            eng.record_decision(int(row["eval_id"]), decision, notes, score or None)
+                            st.rerun()
+                    st.caption("تثبيت أو عدم صلاحية ⇐ يخرج الموظف من هذه القائمة. مد الفترة ⇐ يُجدول تقييم تالٍ تلقائياً.")
 
 # ------------------------------------------------------------ 2. التقييمات المستحقة
 elif page == "📝 التقييمات المستحقة":

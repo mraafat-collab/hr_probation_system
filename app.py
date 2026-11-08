@@ -260,7 +260,25 @@ elif page == "📊 السجل العام":
         code = st.selectbox("ملف الموظف", emps["code"],
                             format_func=lambda c: f"{c} — {emps.set_index('code').at[c, 'name']}")
         ev = eng.get_evaluations(code)
-        st.dataframe(ev.drop(columns="id").rename(columns=COLS), use_container_width=True, hide_index=True)
+        emp = emps[emps["code"] == code].iloc[0]
+        st.markdown("#### 📋 فترات التقييم ونماذجها")
+        st.caption("حمّل نموذج أي فترة بصيغة Word أو Excel (مملوء ببيانات الموظف) ثم اطبعه من الملف.")
+        widths = [3, 1.6, 1.3, 1.6, 1, 1]
+        for col, h in zip(st.columns(widths), ["المرحلة", "الاستحقاق", "الحالة", "القرار", "Word", "Excel"]):
+            col.markdown(f"**{h}**")
+        for _, v in ev.iterrows():
+            payload = {"name": emp["name"], "code": emp["code"], "title": emp["title"], "branch": emp["branch"],
+                       "department": emp["department"], "hire_date": emp["hire_date"], "due_date": v["due_date"],
+                       "stage": v["stage"], "stage_key": v["stage_key"]}
+            cs = st.columns(widths)
+            cs[0].write(v["stage"]); cs[1].write(v["due_date"]); cs[2].write(v["status"]); cs[3].write(v["decision"])
+            d, fn, mm = eng.generate_form(payload, "docx")
+            cs[4].download_button("📄 Word", d, fn, mm, key=f"w_{v['id']}")
+            d, fn, mm = eng.generate_form(payload, "xlsx")
+            cs[5].download_button("📊 Excel", d, fn, mm, key=f"x_{v['id']}")
+        with st.expander("الدرجات والملاحظات"):
+            st.dataframe(ev.drop(columns=["id", "stage_key"]).rename(columns=COLS), use_container_width=True,
+                         hide_index=True)
         with st.expander("⚠️ حذف الموظف نهائياً"):
             if st.checkbox("أؤكد رغبتي في حذف الموظف وكل تقييماته", key="delconfirm"):
                 if st.button("حذف نهائي"):

@@ -1,150 +1,265 @@
-import os
-from datetime import datetime, timedelta
-import pandas as pd
-from database import get_connection
+import io
+from datetime import date, timedelta
+
 import docx
-from docx.shared import Pt, Inches, RGBColor
+import pandas as pd
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
 
-def calculate_due_dates(hire_date):
-    return {
-        '10_days': hire_date + timedelta(days=10),
-        '30_days': hire_date + timedelta(days=30),
-        '60_days': hire_date + timedelta(days=60),
-        '90_days': hire_date + timedelta(days=90),
-        'extension': hire_date + timedelta(days=120)
-    }
+from database import db
 
-def add_employee_with_stages(code, name, title, branch, department, emp_type, hire_date_str):
-    conn = get_connection()
-    cursor = conn.cursor()
-    hire_date = datetime.strptime(hire_date_str, "%Y-%m-%d").date()
-    
-    cursor.execute('''
-        INSERT OR REPLACE INTO employees (code, name, title, branch, department, emp_type, hire_date, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'بالخدمة')
-    ''', (code, name, title, branch, department, emp_type, hire_date))
-    
-    due_dates = calculate_due_dates(hire_date)
-    stage_labels = {
-        '10_days': 'تقييم الـ 10 أيام الأولى',
-        '30_days': 'تقييم الشهر الأول (30 يوم)',
-        '60_days': 'تقييم الشهر الثاني (60 يوم)',
-        '90_days': 'تقييم الـ 90 يوم (نهاية الاختبار)',
-        'extension': 'تقييم فترة التمديد (120 يوم)'
-    }
-    
-    for stage_key, due_date in due_dates.items():
-        cursor.execute('''
-            INSERT INTO evaluations (emp_code, stage, due_date, status, decision)
-            VALUES (?, ?, ?, 'معلق', 'غير محدد')
-        ''', (code, stage_labels[stage_key], due_date))
-        
-    conn.commit()
-    conn.close()
+STAGES = [
+    ("d10", "تقييم الـ 10 أيام الأولى", 10),
+    ("d30", "تقييم الشهر الأول (30 يوماً)", 30),
+    ("d60", "تقييم الشهر الثاني (60 يوماً)", 60),
+    ("d90", "تقييم نهاية الاختبار (90 يوماً)", 90),
+]
+EXTENSION = ("ext", "تقييم فترة التمديد (120 يوماً)", 120)
 
-def get_due_evaluations(days_threshold=7):
-    """جلب التقييمات المستحقة حالياً والتقييمات على وشك الانتهاء خلال عدد أيام محدد"""
-    conn = get_connection()
-    today = datetime.now().date()
-    target_date = today + timedelta(days=days_threshold)
-    
-    query = '''
-        SELECT 
-            e.code, e.name, e.title, e.branch, e.department, e.hire_date,
-            v.id as eval_id, v.stage, v.due_date, v.status, v.decision, v.notes
-        FROM employees e
-        JOIN evaluations v ON e.code = v.emp_code
-        WHERE e.status = 'بالخدمة' AND v.status = 'معلق' AND v.due_date <= ?
-        ORDER BY v.due_date ASC
-    '''
-    df = pd.read_sql_query(query, conn, params=(target_date.strftime("%Y-%m-%d"),))
-    conn.close()
+DECISIONS = ["استمرار في الاختبار", "تثبيت", "مد الفترة", "إنهاء خدمة", "كان كاجوال"]
+END_DECISIONS = {"إنهاء خدمة", "كان كاجوال"}
+
+ELEMENTS = [
+    "المقدرة على الاستيعاب", "المقدرة على اتباع التعليمات", "التفكير البناء والابتكار في العمل",
+    "المقدرة على العمل دون مراقبة", "المقدرة على فرض الاحترام", "المقدرة على العمل مع الغير",
+    "الدقة في العمل والمواعيد", "المثابرة في العمل", "السرعة في إنجاز العمل الموكل إليه",
+    "مستوى المعلومات الفنية",
+]
+
+
+# ----------------------------------------------------------------- الموظفون
+def add_employee(code, name, title, branch, department, emp_type, hire_date: date):
+    code, name = code.strip(), name.strip()
+    with db() as c:
+        if c.execute("SELECT 1 FROM employees WHERE code=?", (code,)).fetchone():
+            return False, f"الكود ({code}) مسجل مسبقاً، لم تتم الإضافة."
+        c.execute(
+            "INSERT INTO employees (code,name,title,branch,department,emp_type,hire_date) VALUES (?,?,?,?,?,?,?)",
+            (code, name, title.strip(), branch.strip(), department.strip(), emp_type, hire_date.isoformat()),
+        )
+        c.executemany(
+            "INSERT INTO evaluations (emp_code,stage_key,stage,due_date) VALUES (?,?,?,?)",
+            [(code, k, lbl, (hire_date + timedelta(days=d)).isoformat()) for k, lbl, d in STAGES],
+        )
+    return True, f"تمت إضافة ({name}) وجدولة {len(STAGES)} مراحل تقييم تلقائياً."
+
+
+def delete_employee(code):
+    with db() as c:
+        c.execute("DELETE FROM evaluations WHERE emp_code=?", (code,))
+        c.execute("DELETE FROM employees WHERE code=?", (code,))
+
+
+def get_employees():
+    with db() as c:
+        return pd.read_sql_query("""
+            SELECT e.code, e.name, e.title, e.branch, e.department, e.emp_type, e.hire_date, e.status,
+                   (SELECT MIN(due_date) FROM evaluations v
+                     WHERE v.emp_code=e.code AND v.status='معلق') AS next_due
+            FROM employees e ORDER BY e.hire_date DESC""", c)
+
+
+def get_evaluations(code):
+    with db() as c:
+        return pd.read_sql_query(
+            "SELECT id, stage, due_date, status, decision, score, evaluated_on, notes "
+            "FROM evaluations WHERE emp_code=? ORDER BY due_date", c, params=(code,))
+
+
+# ----------------------------------------------------------------- التنبيهات
+def _level(days_left):
+    if days_left < 0:
+        return "🔴 متأخر"
+    if days_left <= 3:
+        return "🟠 عاجل"
+    return "🟡 قريب"
+
+
+def get_due_evaluations(days=7):
+    limit = (date.today() + timedelta(days=days)).isoformat()
+    with db() as c:
+        df = pd.read_sql_query("""
+            SELECT e.code, e.name, e.title, e.branch, e.department, e.hire_date,
+                   v.id AS eval_id, v.stage, v.due_date
+            FROM employees e JOIN evaluations v ON e.code=v.emp_code
+            WHERE e.status='بالخدمة' AND v.status='معلق' AND v.due_date <= ?
+            ORDER BY v.due_date""", c, params=(limit,))
+    if not df.empty:
+        df["days_left"] = (pd.to_datetime(df["due_date"]) - pd.Timestamp(date.today())).dt.days
+        df["level"] = df["days_left"].map(_level)
     return df
 
-def generate_docx_evaluation_form(emp_name, emp_code, dept, title, branch, hire_date, due_date, stage_title):
-    """توليد مستند تقييم Word احترافي مطابق لنموذج تقييم الشركة 1.docx"""
-    doc = docx.Document()
-    
-    # ضبط الاتجاه إلى RTL ليدعم اللغة العربية
-    sections = doc.sections
-    for section in sections:
-        section.top_margin = Inches(0.5)
-        section.bottom_margin = Inches(0.5)
-        section.left_margin = Inches(0.5)
-        section.right_margin = Inches(0.5)
 
-    # عنوان التقرير
-    title_p = doc.add_paragraph()
-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title_p.add_run(f"تقرير تقييم الأداء - فترة الاختبار ({stage_title})")
-    run.font.name = 'Arial'
-    run.font.size = Pt(16)
-    run.font.bold = True
-    
-    # جدول بيانات الموظف
-    info_table = doc.add_table(rows=2, cols=4)
-    info_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    info_table.autofit = False
-    
-    headers = [
-        ("اسم الموظف:", emp_name, "الكود:", str(emp_code)),
-        ("القسم / الفرع:", f"{dept} - {branch}", "الوظيفة:", title),
-    ]
-    
-    for r_idx, row_data in enumerate(headers):
-        row = info_table.rows[r_idx]
-        row.cells[0].paragraphs[0].add_run(row_data[0]).font.bold = True
-        row.cells[1].paragraphs[0].add_run(row_data[1])
-        row.cells[2].paragraphs[0].add_run(row_data[2]).font.bold = True
-        row.cells[3].paragraphs[0].add_run(row_data[3])
-        
-    p_dates = doc.add_paragraph()
-    p_dates.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    p_dates.add_run(f"تاريخ التعيين: {hire_date}   |   تاريخ استحقاق التقييم: {due_date}").font.bold = True
-    
-    # جدول عناصر التقييم 10 عناصر
-    doc.add_paragraph("\nعناصر التقييم:")
-    eval_table = doc.add_table(rows=12, cols=7)
-    eval_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    
-    hdr_cells = eval_table.rows[0].cells
-    hdr_titles = ["م", "عناصر التقييم", "4 (ممتاز)", "3 (جيد)", "2 (متوسط)", "1 (ضعيف)", "ملاحظات"]
-    for i, t in enumerate(hdr_titles):
-        cell_p = hdr_cells[i].paragraphs[0]
-        r = cell_p.add_run(t)
-        r.font.bold = True
-        cell_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-    elements = [
-        "المقدرة على الإستيعاب",
-        "المقدرة على اتباع التعليمات",
-        "التفكير البناء و الإبتكار في العمل",
-        "المقدرة على العمل دون مراقبة",
-        "المقدرة على فرض الإحترام",
-        "المقدرة على العمل مع الغير",
-        "الدقة في العمل و المواعيد",
-        "المثابرة في العمل",
-        "السرعة في انجاز العمل الموكل اليه",
-        "مستوى المعلومات الفنية"
-    ]
-    
-    for idx, elem in enumerate(elements, start=1):
-        row_cells = eval_table.rows[idx].cells
-        row_cells[0].paragraphs[0].add_run(str(idx))
-        row_cells[1].paragraphs[0].add_run(elem)
-        
-    # التقييم العام
-    total_row = eval_table.rows[11].cells
-    total_row[1].paragraphs[0].add_run("التقييم العام للموظف").font.bold = True
-    
-    # توصيات وملاحظات
-    doc.add_paragraph("\nنوع المخالفات وتكرارها إن وجد: ........................................................................")
-    doc.add_paragraph("توصية المدير المباشر:  [  ] تثبيت الموظف    [  ] مد فترة الاختبار    [  ] إنهاء خدمة الموظف")
-    doc.add_paragraph("توقيع المدير المباشر: ...........................   التاريخ:     /    / ")
-    doc.add_paragraph("ملاحظات وتوقيع إدارة الموارد البشرية: ...........................................................")
-    
-    filename = f"evaluation_{emp_code}_{due_date}.docx"
-    doc.save(filename)
-    return filename
+def get_stats(days=7):
+    today = date.today().isoformat()
+    limit = (date.today() + timedelta(days=days)).isoformat()
+    base = ("SELECT COUNT(*) FROM evaluations v JOIN employees e ON e.code=v.emp_code "
+            "WHERE e.status='بالخدمة' AND v.status='معلق' AND ")
+    with db() as c:
+        emp = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM employees GROUP BY status")}
+        overdue = c.execute(base + "v.due_date < ?", (today,)).fetchone()[0]
+        soon = c.execute(base + "v.due_date BETWEEN ? AND ?", (today, limit)).fetchone()[0]
+    return {"active": emp.get("بالخدمة", 0), "confirmed": emp.get("مثبت", 0),
+            "out": emp.get("خارج الخدمة", 0), "overdue": overdue, "soon": soon}
+
+
+def pending_by_stage():
+    with db() as c:
+        return pd.read_sql_query(
+            "SELECT v.stage AS stage, COUNT(*) AS n FROM evaluations v "
+            "JOIN employees e ON e.code=v.emp_code "
+            "WHERE e.status='بالخدمة' AND v.status='معلق' GROUP BY v.stage ORDER BY MIN(v.due_date)", c)
+
+
+# ----------------------------------------------------------------- القرارات
+def record_decision(eval_id, decision, notes="", score=None):
+    """يسجل القرار ويطبق أثره تلقائياً على حالة الموظف والمراحل المتبقية."""
+    with db() as c:
+        ev = c.execute("SELECT emp_code FROM evaluations WHERE id=?", (eval_id,)).fetchone()
+        if not ev:
+            return
+        code = ev["emp_code"]
+        c.execute("UPDATE evaluations SET status='تم التقييم', decision=?, notes=?, score=?, evaluated_on=? WHERE id=?",
+                  (decision, notes, score, date.today().isoformat(), eval_id))
+        if decision == "تثبيت" or decision in END_DECISIONS:
+            new_status = "مثبت" if decision == "تثبيت" else "خارج الخدمة"
+            c.execute("UPDATE employees SET status=? WHERE code=?", (new_status, code))
+            c.execute("UPDATE evaluations SET status='ملغي' WHERE emp_code=? AND status='معلق'", (code,))
+        elif decision == "مد الفترة":
+            hire = date.fromisoformat(c.execute("SELECT hire_date FROM employees WHERE code=?", (code,)).fetchone()[0])
+            k, lbl, d = EXTENSION
+            c.execute("INSERT OR IGNORE INTO evaluations (emp_code,stage_key,stage,due_date) VALUES (?,?,?,?)",
+                      (code, k, lbl, (hire + timedelta(days=d)).isoformat()))
+
+
+# ----------------------------------------------------------------- Excel
+def export_excel() -> bytes:
+    with db() as c:
+        emps = pd.read_sql_query(
+            "SELECT code AS 'الكود', name AS 'الاسم', title AS 'الوظيفة', branch AS 'الفرع', department AS 'القسم', "
+            "emp_type AS 'نوع العقد', hire_date AS 'تاريخ التعيين', status AS 'الحالة' FROM employees", c)
+        evs = pd.read_sql_query(
+            "SELECT e.code AS 'الكود', e.name AS 'الاسم', v.stage AS 'المرحلة', v.due_date AS 'تاريخ الاستحقاق', "
+            "v.status AS 'حالة التقييم', v.decision AS 'القرار', v.score AS 'الدرجة', "
+            "v.evaluated_on AS 'تاريخ التقييم', v.notes AS 'ملاحظات' "
+            "FROM evaluations v JOIN employees e ON e.code=v.emp_code ORDER BY v.due_date", c)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for name, df in (("الموظفون", emps), ("التقييمات", evs)):
+            df.to_excel(xw, sheet_name=name, index=False)
+            ws = xw.sheets[name]
+            ws.sheet_view.rightToLeft = True
+            for col in ws.columns:
+                width = max(len(str(cell.value or "")) for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(width + 3, 12), 45)
+    return buf.getvalue()
+
+
+# ----------------------------------------------------------------- نموذج Word (RTL حقيقي)
+def _rtl_p(p, center=False):
+    p._p.get_or_add_pPr().append(OxmlElement("w:bidi"))
+    if center:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_after = Pt(3)
+
+
+def _write(p, text, bold=False, size=11):
+    r = p.add_run(str(text))
+    rPr = r._r.get_or_add_rPr()
+    f = OxmlElement("w:rFonts")
+    for a in ("ascii", "hAnsi", "cs"):
+        f.set(qn("w:" + a), "Arial")
+    rPr.append(f)
+    if bold:
+        rPr.append(OxmlElement("w:b"))
+        rPr.append(OxmlElement("w:bCs"))
+    for tag in ("w:sz", "w:szCs"):
+        e = OxmlElement(tag)
+        e.set(qn("w:val"), str(int(size * 2)))
+        rPr.append(e)
+    rPr.append(OxmlElement("w:rtl"))
+
+
+def _para(d, text, bold=False, size=11, center=False):
+    p = d.add_paragraph()
+    _rtl_p(p, center)
+    _write(p, text, bold, size)
+
+
+def _cell(cell, text, width, bold=False, center=False, shade=None, size=10):
+    cell.width = Cm(width)
+    p = cell.paragraphs[0]
+    _rtl_p(p, center)
+    _write(p, text, bold, size)
+    if shade:
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), shade)
+        cell._tc.get_or_add_tcPr().append(shd)
+
+
+def _rtl_table(t):
+    t.autofit = False
+    tblPr = t._tbl.tblPr
+    tblPr.insert_element_before(
+        OxmlElement("w:bidiVisual"), "w:tblStyleRowBandSize", "w:tblStyleColBandSize", "w:tblW", "w:jc",
+        "w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook")
+
+
+def generate_evaluation_docx(emp: dict) -> bytes:
+    """emp: name, code, title, branch, department, hire_date, due_date, stage"""
+    d = docx.Document()
+    s = d.sections[0]
+    s.page_width, s.page_height = Cm(21), Cm(29.7)
+    s.left_margin = s.right_margin = Cm(1.5)
+    s.top_margin = s.bottom_margin = Cm(1.3)
+
+    _para(d, "تقرير تقييم الأداء – فترة الاختبار", True, 17, True)
+    _para(d, emp["stage"], True, 12, True)
+
+    info = d.add_table(rows=3, cols=4, style="Table Grid")
+    _rtl_table(info)
+    dept = f"{emp.get('department') or '-'} / {emp.get('branch') or '-'}"
+    rows = [("اسم الموظف", emp["name"], "الكود", emp["code"]),
+            ("الوظيفة", emp.get("title") or "-", "القسم / الفرع", dept),
+            ("تاريخ التعيين", emp["hire_date"], "تاريخ استحقاق التقييم", emp["due_date"])]
+    w = [3.2, 5.8, 3.4, 5.6]
+    for col, cw in zip(info.columns, w):
+        col.width = Cm(cw)
+    for r, vals in zip(info.rows, rows):
+        for i, (cell, v) in enumerate(zip(r.cells, vals)):
+            _cell(cell, v, w[i], bold=i % 2 == 0, shade="DCE6F2" if i % 2 == 0 else None)
+
+    _para(d, "")
+    _para(d, "عناصر التقييم", True, 12)
+    t = d.add_table(rows=len(ELEMENTS) + 2, cols=7, style="Table Grid")
+    _rtl_table(t)
+    w = [0.9, 6.0, 1.6, 1.6, 1.6, 1.6, 4.7]
+    for col, cw in zip(t.columns, w):
+        col.width = Cm(cw)
+    heads = ["م", "عناصر التقييم", "4 ممتاز", "3 جيد", "2 متوسط", "1 ضعيف", "ملاحظات"]
+    for i, (cell, h) in enumerate(zip(t.rows[0].cells, heads)):
+        _cell(cell, h, w[i], True, True, "DCE6F2")
+    for n, el in enumerate(ELEMENTS, 1):
+        cells = t.rows[n].cells
+        for i, cell in enumerate(cells):
+            _cell(cell, n if i == 0 else el if i == 1 else "", w[i], center=i == 0)
+    for r in t.rows[1:]:
+        r.height = Cm(0.85)
+    last = t.rows[-1].cells
+    for i, cell in enumerate(last):
+        _cell(cell, "التقييم العام للموظف" if i == 1 else "", w[i], bold=True, shade="F2F2F2")
+
+    _para(d, "")
+    _para(d, "نوع المخالفات وتكرارها إن وجد: " + "." * 70)
+    _para(d, "توصية المدير المباشر:   [    ] تثبيت الموظف     [    ] مد فترة الاختبار     [    ] إنهاء خدمة الموظف", True)
+    _para(d, "")
+    _para(d, "توقيع المدير المباشر: ......................     التاريخ:    /    /")
+    _para(d, "ملاحظات وتوقيع إدارة الموارد البشرية: " + "." * 55)
+
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()

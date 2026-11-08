@@ -1,4 +1,7 @@
 import io
+import os
+import re
+import zipfile
 from datetime import date, timedelta
 
 import docx
@@ -7,6 +10,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
+from xml.sax.saxutils import escape
 
 from database import db
 
@@ -81,7 +85,7 @@ def get_due_evaluations(days=7):
     with db() as c:
         df = pd.read_sql_query("""
             SELECT e.code, e.name, e.title, e.branch, e.department, e.hire_date,
-                   v.id AS eval_id, v.stage, v.due_date
+                   v.id AS eval_id, v.stage_key, v.stage, v.due_date
             FROM employees e JOIN evaluations v ON e.code=v.emp_code
             WHERE e.status='بالخدمة' AND v.status='معلق' AND v.due_date <= ?
             ORDER BY v.due_date""", c, params=(limit,))
@@ -262,3 +266,202 @@ def generate_evaluation_docx(emp: dict) -> bytes:
     buf = io.BytesIO()
     d.save(buf)
     return buf.getvalue()
+
+
+# ----------------------------------------------------------------- نماذج الشركة الرسمية
+TEMPLATES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _to_date(v):
+    return pd.to_datetime(v).date()
+
+
+def fill_10day_xlsx(emp: dict) -> bytes:
+    """يملأ نموذج الـ 10 أيام (Excel) بالتعديل المباشر على XML للحفاظ على الشعار والتنسيق.
+    تُستبدل معادلات XLOOKUP المرتبطة بملف خارجي بقيم ثابتة، ويُحذف الارتباط الخارجي."""
+    hire, due = _to_date(emp["hire_date"]), _to_date(emp["due_date"])
+    code = str(emp["code"]).strip()
+
+    def put(xml, ref, content, numeric=False):
+        m = re.search(r'<c r="%s"([^>]*?)(?:/>|>.*?</c>)' % ref, xml, re.S)
+        s = re.search(r' s="(\d+)"', m.group(1))
+        sattr = f' s="{s.group(1)}"' if s else ""
+        if numeric:
+            new = f'<c r="{ref}"{sattr}><v>{content}</v></c>'
+        else:
+            new = f'<c r="{ref}"{sattr} t="inlineStr"><is><t xml:space="preserve">{escape(str(content))}</t></is></c>'
+        return xml[:m.start()] + new + xml[m.end():]
+
+    serial = lambda d: (d - date(1899, 12, 30)).days
+    zin = zipfile.ZipFile(os.path.join(TEMPLATES, "form_10_days.xlsx"))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            n = item.filename
+            if n.startswith("xl/externalLinks/") or n == "xl/calcChain.xml":
+                continue
+            data = zin.read(n)
+            if n == "xl/worksheets/sheet1.xml":
+                x = data.decode("utf-8")
+                x = put(x, "B2", emp["name"])
+                x = put(x, "B3", code, numeric=code.isdigit())
+                x = put(x, "B4", emp.get("title") or "-")
+                x = put(x, "B5", emp.get("branch") or "-")
+                x = put(x, "K3", serial(hire), True)
+                x = put(x, "K4", serial(due), True)
+                data = x.encode("utf-8")
+            elif n == "xl/workbook.xml":
+                data = re.sub(rb"<externalReferences>.*?</externalReferences>", b"", data, flags=re.S)
+            elif n == "xl/_rels/workbook.xml.rels":
+                data = re.sub(rb'<Relationship [^>]*Target="(?:externalLinks/externalLink1\.xml|calcChain\.xml)"[^>]*/>', b"", data)
+            elif n == "[Content_Types].xml":
+                data = re.sub(rb'<Override [^>]*PartName="/xl/(?:externalLinks/externalLink1\.xml|calcChain\.xml)"[^>]*/>', b"", data)
+            zout.writestr(item, data)
+    return out.getvalue()
+
+
+_LABELS = ["تاريخ انتهاء الاختبار", "تاريخ التعيين", "اسم الموظف", "الكود", "القسم", "الوظيفة", "الفرع"]
+
+
+def fill_eval_docx(emp: dict) -> bytes:
+    """يملأ نموذج التقييم Word الرسمي (للمراحل بعد الـ 10 أيام)."""
+    d = docx.Document(os.path.join(TEMPLATES, "form_evaluation.docx"))
+    fmt = lambda v: _to_date(v).strftime("%d-%m-%Y")
+    vals = {"اسم الموظف": emp["name"], "الكود": emp["code"], "القسم": emp.get("department") or "-",
+            "الوظيفة": emp.get("title") or "-", "الفرع": emp.get("branch") or "-",
+            "تاريخ التعيين": fmt(emp["hire_date"]), "تاريخ انتهاء الاختبار": fmt(emp["due_date"])}
+    pat = re.compile(r"^\s*(%s)\s*:" % "|".join(_LABELS))
+    for t in d.tables:
+        for row in t.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    m = pat.match(p.text)
+                    if m and p.runs:
+                        p.runs[0].text = f"{m.group(1)} : {vals[m.group(1)]}"
+                        for r in p.runs[1:]:
+                            r.text = ""
+
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def generate_form(row: dict):
+    """يختار النموذج المناسب: Excel لتقييم الـ 10 أيام، وWord لباقي المراحل. يعيد (bytes, اسم الملف, mime)."""
+    k = row.get("stage_key")
+    k = None if k is None or (isinstance(k, float) and pd.isna(k)) else k
+    is10 = k == "d10" or (k is None and "10" in str(row.get("stage", "")))
+    code = row["code"]
+    try:
+        if is10 and os.path.exists(os.path.join(TEMPLATES, "form_10_days.xlsx")):
+            return fill_10day_xlsx(row), f"تقييم_10_ايام_{code}.xlsx", XLSX_MIME
+        if os.path.exists(os.path.join(TEMPLATES, "form_evaluation.docx")):
+            return fill_eval_docx(row), f"تقييم_{code}_{row['due_date']}.docx", DOCX_MIME
+    except Exception:
+        pass  # عند أي مشكلة في القالب نستخدم النموذج المُولَّد داخلياً
+    return generate_evaluation_docx(row), f"تقييم_{code}_{row['due_date']}.docx", DOCX_MIME
+
+
+# ----------------------------------------------------------------- استيراد من Excel
+IMPORT_HEADERS = ["كود", "الاسم", "المسمى الوظيفي", "الموقع", "القسم", "تاريخ التعيين",
+                  "10 أيام", "1", "2", "3", "4", "التقييم النهائي"]
+
+
+def _norm(h):
+    if isinstance(h, float) and h.is_integer():
+        h = int(h)
+    s = str(h).strip().lower()
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")):
+        s = s.replace(a, b)
+    return re.sub(r"\s+", "", s)
+
+
+def _decision(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = _norm(v)
+    if s in ("", "-", "nan", "none"):
+        return None
+    if "تثبيت" in s:
+        return "تثبيت"
+    if "مد" in s:
+        return "مد الفترة"
+    if "انهاء" in s:
+        return "إنهاء خدمة"
+    if "كاجوال" in s:
+        return "كان كاجوال"
+    return str(v).strip()
+
+
+def import_template() -> bytes:
+    buf = io.BytesIO()
+    pd.DataFrame(columns=IMPORT_HEADERS).to_excel(buf, index=False)
+    return buf.getvalue()
+
+
+def import_employees(df: pd.DataFrame):
+    """استيراد موظفين مع سجل تقييماتهم السابق.
+    الأعمدة: 10 أيام ⇐ تقييم 10 أيام | 1 ⇐ 30 يوماً | 3 ⇐ 90 يوماً | 4 ⇐ الامتداد | 2 ⇐ تُحفظ كملاحظة.
+    القيمة "-" ⇐ لم يُسجَّل تقييم (تُلغى المرحلة إن فات موعدها وإلا تبقى معلقة)."""
+    cols = {_norm(c): c for c in df.columns}
+    pick = lambda *names: next((cols[_norm(n)] for n in names if _norm(n) in cols), None)
+    c = dict(code=pick("كود", "الكود"), name=pick("الاسم"), title=pick("المسمى الوظيفي", "الوظيفة"),
+             branch=pick("الموقع", "الفرع"), dept=pick("القسم"), hire=pick("تاريخ التعيين"),
+             d10=pick("10 أيام", "أيام 10", "10"), m1=pick("1"), m2=pick("2"), m3=pick("3"), m4=pick("4"),
+             final=pick("التقييم النهائي"))
+    missing = [k for k in ("code", "name", "hire") if not c[k]]
+    if missing:
+        return {"added": [], "skipped": [], "errors": ["ملف غير صالح: أعمدة (كود، الاسم، تاريخ التعيين) مطلوبة."]}
+
+    def val(r, k):
+        v = r[c[k]] if c[k] else None
+        return None if v is None or (isinstance(v, float) and pd.isna(v)) else v
+
+    today = date.today()
+    res = {"added": [], "skipped": [], "errors": []}
+    for i, r in df.iterrows():
+        raw = val(r, "code")
+        if raw is None:
+            continue
+        code = str(int(raw)) if isinstance(raw, float) and raw.is_integer() else str(raw).strip()
+        hire = pd.to_datetime(val(r, "hire"), errors="coerce")
+        name = str(val(r, "name") or "").strip()
+        if pd.isna(hire) or not name:
+            res["errors"].append(f"الصف {i + 2} (كود {code}): الاسم أو تاريخ التعيين غير صالح.")
+            continue
+        hire = hire.date()
+        title = str(val(r, "title") or "").strip()
+        decs = {"d10": _decision(val(r, "d10")), "d30": _decision(val(r, "m1")),
+                "d90": _decision(val(r, "m3")), "ext": _decision(val(r, "m4"))}
+        month2, final = _decision(val(r, "m2")), _decision(val(r, "final"))
+        with db() as cn:
+            if cn.execute("SELECT 1 FROM employees WHERE code=?", (code,)).fetchone():
+                res["skipped"].append((code, "الكود مسجل مسبقاً"))
+                continue
+            cn.execute("INSERT INTO employees (code,name,title,branch,department,emp_type,hire_date) VALUES (?,?,?,?,?,?,?)",
+                       (code, name, title, str(val(r, "branch") or "").strip(), str(val(r, "dept") or "").strip(),
+                        "كاجوال" if "كاجوال" in title else "دائم", hire.isoformat()))
+            plan = [(k, lbl, d) for k, lbl, d in STAGES]
+            d90_due = hire + timedelta(days=90)
+            if decs["ext"] or (final == "مد الفترة" and d90_due <= today):
+                plan.append(EXTENSION)
+            for k, lbl, d in plan:
+                due, dec = hire + timedelta(days=d), decs.get(k)
+                if dec:
+                    status, decision, note = "تم التقييم", dec, "مستورد من Excel"
+                elif due < today and k != "ext":
+                    status, decision, note = "ملغي", "غير مسجل", "لا يوجد تقييم مسجل (مستورد)"
+                else:
+                    status, decision, note = "معلق", "غير محدد", None
+                if k == "d30" and month2:
+                    note = f"{note or ''} | تقييم الشهر 2: {month2}".strip(" |")
+                cn.execute("INSERT INTO evaluations (emp_code,stage_key,stage,due_date,status,decision,notes) "
+                           "VALUES (?,?,?,?,?,?,?)", (code, k, lbl, due.isoformat(), status, decision, note))
+            if final == "تثبيت" or final in END_DECISIONS:
+                cn.execute("UPDATE employees SET status=? WHERE code=?",
+                           ("مثبت" if final == "تثبيت" else "خارج الخدمة", code))
+                cn.execute("UPDATE evaluations SET status='ملغي' WHERE emp_code=? AND status='معلق'", (code,))
+        res["added"].append((code, name))
+    return res

@@ -21,8 +21,8 @@ STAGES = [
 ]
 EXTENSION = ("ext", "تقييم فترة الامتداد (بعد الـ 90 يوماً)", 120)
 
-DECISIONS = ["استمرار في الاختبار", "تثبيت", "مد الفترة", "إنهاء خدمة", "كان كاجوال"]
-END_DECISIONS = {"إنهاء خدمة", "كان كاجوال"}
+DECISIONS = ["استمرار في الاختبار", "تثبيت", "مد الفترة", "عدم صلاحية", "إنهاء خدمة", "كان كاجوال"]
+END_DECISIONS = {"عدم صلاحية", "إنهاء خدمة", "كان كاجوال"}
 
 ELEMENTS = [
     "المقدرة على الاستيعاب", "المقدرة على اتباع التعليمات", "التفكير البناء والابتكار في العمل",
@@ -117,6 +117,46 @@ def pending_by_stage():
 
 
 # ----------------------------------------------------------------- القرارات
+def _add_extension_stage(c, code):
+    n = c.execute("SELECT COUNT(*) FROM evaluations WHERE emp_code=? AND stage_key LIKE 'ext%'", (code,)).fetchone()[0]
+    last = c.execute("SELECT MAX(due_date) FROM evaluations WHERE emp_code=?", (code,)).fetchone()[0]
+    due = max(date.fromisoformat(last), date.today()) + timedelta(days=30)
+    c.execute("INSERT INTO evaluations (emp_code,stage_key,stage,due_date) VALUES (?,?,?,?)",
+              (code, f"ext{n + 1}", f"تقييم تمديد إضافي ({n + 1})", due.isoformat()))
+
+
+def add_extra_stage(code):
+    with db() as c:
+        _add_extension_stage(c, code)
+
+
+def get_active_probation():
+    """كل من لم يُتخذ في حقه تثبيت أو عدم صلاحية، مع أقرب تقييم معلق له."""
+    with db() as c:
+        df = pd.read_sql_query("""
+            SELECT e.code, e.name, e.title, e.branch, e.department, e.hire_date,
+                   v.id AS eval_id, v.stage_key, v.stage, v.due_date
+            FROM employees e
+            LEFT JOIN evaluations v ON v.id = (SELECT id FROM evaluations
+                 WHERE emp_code=e.code AND status='معلق' ORDER BY due_date LIMIT 1)
+            WHERE e.status='بالخدمة'
+            ORDER BY v.due_date IS NULL, v.due_date""", c)
+    days = (pd.to_datetime(df["due_date"]) - pd.Timestamp(date.today())).dt.days
+    df["days_left"] = days.astype("Int64")
+    df["level"] = [_level(d) if pd.notna(d) else "⚪ بلا مرحلة" for d in days]
+    df["stage"] = df["stage"].fillna("— لا توجد مرحلة معلقة")
+    return df
+
+
+def forms_zip(df) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for _, r in df[df["eval_id"].notna()].iterrows():
+            data, fname, _m = generate_form(r.to_dict())
+            z.writestr(fname, data)
+    return buf.getvalue()
+
+
 def record_decision(eval_id, decision, notes="", score=None):
     """يسجل القرار ويطبق أثره تلقائياً على حالة الموظف والمراحل المتبقية."""
     with db() as c:
@@ -135,6 +175,8 @@ def record_decision(eval_id, decision, notes="", score=None):
             k, lbl, d = EXTENSION
             c.execute("INSERT OR IGNORE INTO evaluations (emp_code,stage_key,stage,due_date) VALUES (?,?,?,?)",
                       (code, k, lbl, (hire + timedelta(days=d)).isoformat()))
+            if not c.execute("SELECT 1 FROM evaluations WHERE emp_code=? AND status='معلق'", (code,)).fetchone():
+                _add_extension_stage(c, code)  # التمديد المتكرر: يبقى دائماً تقييم قادم حتى القرار النهائي
 
 
 # ----------------------------------------------------------------- Excel
@@ -388,6 +430,8 @@ def _decision(v):
         return "تثبيت"
     if "مد" in s:
         return "مد الفترة"
+    if "صلاحي" in s:
+        return "عدم صلاحية"
     if "انهاء" in s:
         return "إنهاء خدمة"
     if "كاجوال" in s:

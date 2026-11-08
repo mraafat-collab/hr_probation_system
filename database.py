@@ -62,6 +62,8 @@ def init_db():
                 c.execute(f"ALTER TABLE evaluations ADD COLUMN {col} {ddl}")
         # يمنع تكرار نفس المرحلة لنفس الموظف
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_eval_stage ON evaluations(emp_code, stage_key)")
+        # مرحلة الـ 60 يوماً أُلغيت من النظام: تُلغى المعلقة منها للبيانات القديمة
+        c.execute("UPDATE evaluations SET status='ملغي' WHERE stage_key='d60' AND status='معلق'")
         c.execute("CREATE INDEX IF NOT EXISTS ix_eval_due ON evaluations(status, due_date)")
 
 

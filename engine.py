@@ -67,7 +67,7 @@ def get_employees():
 def get_evaluations(code):
     with db() as c:
         return pd.read_sql_query(
-            "SELECT id, stage, due_date, status, decision, score, evaluated_on, notes "
+            "SELECT id, stage_key, stage, due_date, status, decision, score, evaluated_on, notes "
             "FROM evaluations WHERE emp_code=? ORDER BY due_date", c, params=(code,))
 
 
@@ -353,6 +353,7 @@ def fill_10day_xlsx(emp: dict) -> bytes:
                 x = put(x, "B5", emp.get("branch") or "-")
                 x = put(x, "K3", serial(hire), True)
                 x = put(x, "K4", serial(due), True)
+                x = put(x, "K5", f"{(due - hire).days} days")
                 data = x.encode("utf-8")
             elif n == "xl/workbook.xml":
                 data = re.sub(rb"<externalReferences>.*?</externalReferences>", b"", data, flags=re.S)
@@ -390,20 +391,22 @@ def fill_eval_docx(emp: dict) -> bytes:
     return buf.getvalue()
 
 
-def generate_form(row: dict):
-    """يختار النموذج المناسب: Excel لتقييم الـ 10 أيام، وWord لباقي المراحل. يعيد (bytes, اسم الملف, mime)."""
+def generate_form(row: dict, fmt=None):
+    """يعيد (bytes, اسم الملف, mime). fmt: "xlsx" أو "docx"؛ وإن لم يُحدَّد فـ Excel لتقييم الـ 10 أيام وWord لغيره."""
     k = row.get("stage_key")
     k = None if k is None or (isinstance(k, float) and pd.isna(k)) else k
     is10 = k == "d10" or (k is None and "10" in str(row.get("stage", "")))
+    fmt = fmt or ("xlsx" if is10 else "docx")
     code = row["code"]
+    tag = f"{(_to_date(row['due_date']) - _to_date(row['hire_date'])).days}_يوم"
     try:
-        if is10 and os.path.exists(os.path.join(TEMPLATES, "form_10_days.xlsx")):
-            return fill_10day_xlsx(row), f"تقييم_10_ايام_{code}.xlsx", XLSX_MIME
-        if os.path.exists(os.path.join(TEMPLATES, "form_evaluation.docx")):
-            return fill_eval_docx(row), f"تقييم_{code}_{row['due_date']}.docx", DOCX_MIME
+        if fmt == "xlsx" and os.path.exists(os.path.join(TEMPLATES, "form_10_days.xlsx")):
+            return fill_10day_xlsx(row), f"تقييم_{tag}_{code}.xlsx", XLSX_MIME
+        if fmt == "docx" and os.path.exists(os.path.join(TEMPLATES, "form_evaluation.docx")):
+            return fill_eval_docx(row), f"تقييم_{tag}_{code}.docx", DOCX_MIME
     except Exception:
         pass  # عند أي مشكلة في القالب نستخدم النموذج المُولَّد داخلياً
-    return generate_evaluation_docx(row), f"تقييم_{code}_{row['due_date']}.docx", DOCX_MIME
+    return generate_evaluation_docx(row), f"تقييم_{tag}_{code}.docx", DOCX_MIME
 
 
 # ----------------------------------------------------------------- استيراد من Excel

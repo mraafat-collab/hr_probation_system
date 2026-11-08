@@ -8,14 +8,29 @@ import streamlit as st
 import engine as eng
 from database import DB_PATH, init_db
 
-st.set_page_config(page_title="نظام متابعة فترات الاختبار", page_icon="📋", layout="wide")
+st.set_page_config(page_title="RUFI", page_icon="📋", layout="wide", initial_sidebar_state="collapsed")
 init_db()
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap');
 html, body, .stApp, .stMarkdown, button, input, textarea, select { font-family: 'Cairo', sans-serif !important; }
-.stApp, section[data-testid="stSidebar"] { direction: rtl; }
+.stApp { direction: rtl; }
+section[data-testid="stSidebar"], div[data-testid="stSidebarCollapsedControl"],
+div[data-testid="collapsedControl"], button[kind="header"] { display: none !important; }
+.brand { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:10px; }
+.brand .logo { font-size:2rem; font-weight:700; color:#1F3864; letter-spacing:3px; }
+.brand .logo span { color:#ED7D31; }
+.brand .sub { color:#5b6577; font-size:.9rem; margin-right:10px; }
+.badge { padding:6px 14px; border-radius:20px; font-weight:600; font-size:.9rem; }
+.badge.red { background:#fde8e8; color:#C00000; } .badge.orange { background:#fff1e3; color:#c25a00; }
+.badge.green { background:#e6f4ec; color:#2E8B57; }
+div[data-testid="stRadio"] > div[role="radiogroup"] { gap:6px; flex-wrap:wrap; background:#f4f6fa;
+        padding:6px; border-radius:14px; }
+div[data-testid="stRadio"] label { background:transparent; padding:8px 18px; border-radius:10px; cursor:pointer; margin:0; }
+div[data-testid="stRadio"] label > div:first-child { display:none; }
+div[data-testid="stRadio"] label:has(input:checked) { background:#1F3864; }
+div[data-testid="stRadio"] label:has(input:checked) p { color:#fff !important; font-weight:700; }
 .stTextInput input, .stTextArea textarea, .stNumberInput input { direction: rtl; text-align: right; }
 .block-container { padding-top: 1.5rem; max-width: 1300px; }
 .hero { background: linear-gradient(135deg,#1F3864,#2F5597); color:#fff; padding:22px 28px;
@@ -44,7 +59,7 @@ def _password():
 
 pwd = _password()
 if pwd and not st.session_state.get("auth"):
-    st.markdown('<div class="hero"><h1>🔒 تسجيل الدخول</h1><p>نظام متابعة فترات الاختبار</p></div>',
+    st.markdown('<div class="hero"><h1>🔒 RUFI</h1><p>تسجيل الدخول</p></div>',
                 unsafe_allow_html=True)
     entered = st.text_input("كلمة المرور", type="password")
     if st.button("دخول", type="primary"):
@@ -65,20 +80,29 @@ def kpi(col, label, value, color):
                  f'<div class="l">{label}</div></div>', unsafe_allow_html=True)
 
 
-# ------------------------------------------------------------ الشريط الجانبي
-st.sidebar.markdown("## 📋 إدارة فترات الاختبار")
-days = st.sidebar.slider("نافذة التنبيه المبكر (أيام)", 0, 30, 7)
+# ------------------------------------------------------------ الشريط العلوي
+if "days" not in st.session_state:
+    st.session_state["days"] = 7
+days = st.session_state["days"]
 stats = eng.get_stats(days)
 if stats["overdue"]:
-    st.sidebar.error(f"🔴 {stats['overdue']} تقييم متأخر!")
+    badge = f'<span class="badge red">🔴 {stats["overdue"]} تقييم متأخر</span>'
 elif stats["soon"]:
-    st.sidebar.warning(f"🟠 {stats['soon']} تقييم قريب الاستحقاق")
+    badge = f'<span class="badge orange">🟠 {stats["soon"]} تقييم قريب الاستحقاق</span>'
 else:
-    st.sidebar.success("✅ لا توجد تقييمات عاجلة")
+    badge = '<span class="badge green">✅ لا توجد تقييمات عاجلة</span>'
+st.markdown(f'<div class="brand"><div><span class="logo">RU<span>FI</span></span>'
+            f'<span class="sub">متابعة فترات الاختبار · {date.today():%Y-%m-%d}</span></div>{badge}</div>',
+            unsafe_allow_html=True)
 
-page = st.sidebar.radio("القائمة", ["🏠 لوحة المتابعة", "📝 التقييمات المستحقة", "➕ إضافة موظف",
-                                    "📊 السجل العام", "📥 التصدير والنسخ الاحتياطي"], label_visibility="collapsed")
-st.sidebar.caption(f"اليوم: {date.today():%Y-%m-%d}")
+nav_col, set_col = st.columns([5, 1.6])
+with nav_col:
+    page = st.radio("القائمة", ["🏠 لوحة المتابعة", "📝 التقييمات المستحقة", "➕ إضافة موظف",
+                                "📊 السجل العام", "📥 التصدير والنسخ الاحتياطي"],
+                    horizontal=True, label_visibility="collapsed")
+with set_col:
+    st.number_input("نافذة التنبيه (أيام)", min_value=0, max_value=30, key="days")
+st.write("")
 
 COLS = {"code": "الكود", "name": "الاسم", "title": "الوظيفة", "branch": "الفرع", "department": "القسم",
         "stage": "المرحلة", "due_date": "تاريخ الاستحقاق", "days_left": "الأيام المتبقية", "level": "الأولوية",
@@ -153,7 +177,7 @@ elif page == "📝 التقييمات المستحقة":
 
 # ------------------------------------------------------------ 3. إضافة موظف
 elif page == "➕ إضافة موظف":
-    hero("إضافة موظف جديد", "تُجدول مواعيد التقييم (10 / 30 / 60 / 90 يوماً) تلقائياً")
+    hero("إضافة موظف جديد", "تُجدول مواعيد التقييم (10 / 30 / 90 يوماً + الامتداد) تلقائياً")
     with st.form("add_emp", clear_on_submit=True):
         a, b = st.columns(2)
         code = a.text_input("كود الموظف *")

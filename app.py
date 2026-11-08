@@ -98,7 +98,7 @@ st.markdown(f'<div class="brand"><div><span class="logo">RU<span>FI</span></span
 nav_col, set_col = st.columns([5, 1.6])
 with nav_col:
     page = st.radio("القائمة", ["🏠 لوحة المتابعة", "📝 التقييمات المستحقة", "➕ إضافة موظف",
-                                "📊 السجل العام", "📥 التصدير والنسخ الاحتياطي"],
+                                "📊 السجل العام", "📤 استيراد", "📥 التصدير والنسخ الاحتياطي"],
                     horizontal=True, label_visibility="collapsed")
 with set_col:
     st.number_input("نافذة التنبيه (أيام)", min_value=0, max_value=30, key="days")
@@ -156,13 +156,10 @@ elif page == "📝 التقييمات المستحقة":
         left, right = st.columns(2)
         with left:
             st.markdown("#### 📄 نموذج التقييم")
-            st.caption("نموذج Word عربي (من اليمين لليسار) جاهز للطباعة والتوقيع.")
-            data = eng.generate_evaluation_docx({k: row[k] for k in
-                                                 ["name", "code", "title", "branch", "department", "hire_date",
-                                                  "due_date", "stage"]})
-            st.download_button("📄 تحميل نموذج التقييم", data, f"تقييم_{row['code']}_{row['due_date']}.docx",
-                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                               use_container_width=True)
+            st.caption("نموذج الشركة الرسمي معبأ ببيانات الموظف: Excel لتقييم الـ 10 أيام، وWord لباقي المراحل.")
+            data, fname, mime = eng.generate_form(row.to_dict())
+            kind = "Excel" if fname.endswith(".xlsx") else "Word"
+            st.download_button(f"📄 تحميل نموذج التقييم ({kind})", data, fname, mime, use_container_width=True)
         with right:
             st.markdown("#### ✅ تسجيل القرار")
             with st.form("decision"):
@@ -221,7 +218,26 @@ elif page == "📊 السجل العام":
                     eng.delete_employee(code)
                     st.rerun()
 
-# ------------------------------------------------------------ 5. التصدير والنسخ الاحتياطي
+# ------------------------------------------------------------ 5. استيراد من Excel
+elif page == "📤 استيراد":
+    hero("استيراد موظفين من Excel", "أضف عدداً من الموظفين مع سجل تقييماتهم السابق دفعة واحدة")
+    st.download_button("📄 تحميل قالب الاستيراد", eng.import_template(), "قالب_استيراد_RUFI.xlsx", eng.XLSX_MIME)
+    st.caption("الأعمدة: كود، الاسم، المسمى الوظيفي، الموقع، القسم، تاريخ التعيين، 10 أيام، 1، 2، 3، 4، التقييم النهائي. "
+               "عمود 1 = تقييم 30 يوماً، 3 = تقييم 90 يوماً، 4 = الامتداد، 2 يُحفظ كملاحظة. استخدم - إن لم يوجد تقييم.")
+    up = st.file_uploader("ارفع ملف Excel", type=["xlsx"])
+    if up:
+        df_in = pd.read_excel(up)
+        st.dataframe(df_in, use_container_width=True, hide_index=True)
+        if st.button("استيراد الآن", type="primary"):
+            res = eng.import_employees(df_in)
+            if res["added"]:
+                st.success(f"تم استيراد {len(res['added'])} موظف: " + "، ".join(n for _, n in res["added"]))
+            for code, why in res["skipped"]:
+                st.warning(f"تم تخطي {code}: {why}")
+            for err in res["errors"]:
+                st.error(err)
+
+# ------------------------------------------------------------ 6. التصدير والنسخ الاحتياطي
 else:
     hero("التصدير والنسخ الاحتياطي", "تقارير للإدارة العليا وحماية البيانات")
     a, b = st.columns(2)
